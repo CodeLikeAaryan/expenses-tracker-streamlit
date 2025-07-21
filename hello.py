@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import altair as alt
 
-# — Page Config (hamburger on mobile) —
+# — Page Config —
 st.set_page_config(
     page_title="📊 Mobile Expense Tracker",
     layout="wide",
@@ -14,36 +14,35 @@ st.set_page_config(
 # — Database Setup —
 conn = sqlite3.connect("expenses.db", check_same_thread=False)
 c = conn.cursor()
-
 # Create tables if they don't exist
 c.execute("""CREATE TABLE IF NOT EXISTS expenses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT,
     category TEXT,
     amount REAL,
     notes TEXT
 )""")
 c.execute("""CREATE TABLE IF NOT EXISTS balances (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT,
     amount REAL,
     notes TEXT
 )""")
 c.execute("""CREATE TABLE IF NOT EXISTS account_balance (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT,
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    date    TEXT,
     balance REAL,
-    notes TEXT
+    notes   TEXT
 )""")
 c.execute("""CREATE TABLE IF NOT EXISTS records (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT,
-    action TEXT,
-    details TEXT
+    action    TEXT,
+    details   TEXT
 )""")
 conn.commit()
 
-# — Helper to fetch metrics & cache them —
+# — Cached Metrics —
 @st.cache_data
 def get_sums():
     today_iso = date.today().isoformat()
@@ -62,54 +61,74 @@ def get_sums():
     if row:
         manual_date_iso, manual_bal = row
     else:
-        manual_date_iso, manual_bal = "1970-01-01", 0.0
-    # Credits since manual set
+        manual_date_iso, manual_bal = today_iso, 0.0
+    # Dynamic balance
     cred_after = c.execute(
         "SELECT COALESCE(SUM(amount),0) FROM balances WHERE date >= ?", (manual_date_iso,)
     ).fetchone()[0]
-    # Expenses since manual set
     exp_after = c.execute(
         "SELECT COALESCE(SUM(amount),0) FROM expenses WHERE date >= ?", (manual_date_iso,)
     ).fetchone()[0]
-    # Dynamic balance
     current_bal = manual_bal + cred_after - exp_after
-    return today_exp, total_cred, current_bal
+    # Averages
+    d7 = (date.today() - timedelta(days=6)).isoformat()
+    sum7 = c.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM expenses WHERE date BETWEEN ? AND ?", (d7, today_iso)
+    ).fetchone()[0]
+    avg7 = sum7 / 7
+    d30 = (date.today() - timedelta(days=29)).isoformat()
+    sum30 = c.execute(
+        "SELECT COALESCE(SUM(amount),0) FROM expenses WHERE date BETWEEN ? AND ?", (d30, today_iso)
+    ).fetchone()[0]
+    avg30 = sum30 / 30
+    return today_exp, total_cred, current_bal, avg7, avg30
+
+# — Session override defaults —
+for key in ("override_today", "override_credit", "override_balance"):
+    if key not in st.session_state:
+        st.session_state[key] = None
 
 # — Sidebar Navigation —
 st.sidebar.title("⚙️ Menu")
-page = st.sidebar.radio("", ["Dashboard / Add", "Reports", "Records"])
+page = st.sidebar.radio("", ["Dashboard / Add", "Edit Details", "Reports", "Records"])
 
+# — Helper to apply overrides —
+def get_metrics():
+    today_exp, total_cred, current_bal, avg7, avg30 = get_sums()
+    if st.session_state.override_today is not None:
+        today_exp = st.session_state.override_today
+    if st.session_state.override_credit is not None:
+        total_cred = st.session_state.override_credit
+    if st.session_state.override_balance is not None:
+        current_bal = st.session_state.override_balance
+    return today_exp, total_cred, current_bal, avg7, avg30
+
+# — Main Pages —
 if page == "Dashboard / Add":
-    # Top metrics
-    today_exp, total_cred, current_bal = get_sums()
-    m1, m2, m3 = st.columns(3)
-    m1.metric("💸 Today's Spent", f"₹{today_exp:,.2f}")
-    m2.metric("💰 Total Credited", f"₹{total_cred:,.2f}")
-    m3.metric("🏦 Bank Balance", f"₹{current_bal:,.2f}")
+    today_exp, total_cred, current_bal, avg7, avg30 = get_metrics()
+    cols = st.columns(5)
+    cols[0].metric("💸 Today's Spent", f"₹{today_exp:,.2f}")
+    cols[1].metric("💰 Total Credited", f"₹{total_cred:,.2f}")
+    cols[2].metric("🏦 Bank Balance", f"₹{current_bal:,.2f}")
+    cols[3].metric("🗓️ Weekly Average", f"₹{avg7:,.2f}")
+    cols[4].metric("🌐 Monthly Average", f"₹{avg30:,.2f}")
 
     st.markdown("---")
     action = st.radio(
-        "What would you like to do?",
-        ["Add Expense", "Add Balance", "Set Bank Amount"],
-        horizontal=True
+        "Action:", ["Add Expense", "Add Credited Amount", "Set Bank Amount"], horizontal=True
     )
 
     if action == "Add Expense":
         st.subheader("➕ Add a New Expense")
         with st.form("expense_form", clear_on_submit=True):
             c1, c2, c3, c4 = st.columns([2,2,2,4])
-            with c1:
-                exp_date = st.date_input("Date", date.today())
-            with c2:
-                category = st.selectbox("Category", [
-                    "Food","Learning","Investment",
-                    "Entertainment","Shopping",
-                    "Loans And Family","Miscellaneous"
-                ])
-            with c3:
-                amt_text = st.text_input("Amount (₹)", placeholder="e.g. 150.75")
-            with c4:
-                notes = st.text_input("Notes (optional)")
+            exp_date = c1.date_input("Date", date.today())
+            category = c2.selectbox("Category", [
+                "Food","Learning","Investment","Entertainment",
+                "Shopping","Loans And Family","Miscellaneous"
+            ])
+            amt_text = c3.text_input("Amount (₹)", placeholder="e.g. 150.75")
+            notes = c4.text_input("Notes (optional)")
             if st.form_submit_button("Add Expense"):
                 try:
                     amt = float(amt_text)
@@ -131,17 +150,38 @@ if page == "Dashboard / Add":
                     st.rerun()
                 except ValueError:
                     st.error("❌ Enter a valid number for Amount.")
+        # Delete today's expenses
+        st.markdown("**🗑️ Delete Today's Expenses**")
+        today_str = date.today().isoformat()
+        df_today = pd.read_sql_query(
+            "SELECT id, category, amount FROM expenses WHERE date = ?", conn,
+            params=(today_str,)
+        )
+        if not df_today.empty:
+            to_delete = st.multiselect(
+                "Select IDs to delete:",
+                options=df_today.id.tolist(),
+                format_func=lambda x: f"{x} → {df_today[df_today.id==x].category.values[0]}, ₹{df_today[df_today.id==x].amount.values[0]:.2f}"
+            )
+            if st.button("Delete Selected"):
+                for did in to_delete:
+                    c.execute("DELETE FROM expenses WHERE id = ?", (did,))
+                    c.execute(
+                        "INSERT INTO records (timestamp, action, details) VALUES (?,?,?)",
+                        (datetime.now().isoformat(), "Delete Expense", f"ID {did}")
+                    )
+                conn.commit()
+                st.success(f"Deleted IDs: {to_delete}")
+                st.cache_data.clear()
+                st.rerun()
 
     elif action == "Add Balance":
         st.subheader("➕ Add a Balance (Credit)")
         with st.form("balance_form", clear_on_submit=True):
             b1, b2, b3 = st.columns([2,2,6])
-            with b1:
-                bal_date = st.date_input("Date", date.today())
-            with b2:
-                bal_text = st.text_input("Credit Amount (₹)", placeholder="e.g. 2000.00")
-            with b3:
-                bal_notes = st.text_input("Notes (optional)")
+            bal_date = b1.date_input("Date", date.today())
+            bal_text = b2.text_input("Credit Amount (₹)", placeholder="e.g. 2000.00")
+            bal_notes = b3.text_input("Notes (optional)")
             if st.form_submit_button("Add Balance"):
                 try:
                     bal_amt = float(bal_text)
@@ -168,12 +208,9 @@ if page == "Dashboard / Add":
         st.subheader("🏦 Set Bank Account Amount")
         with st.form("bank_form", clear_on_submit=True):
             b1, b2, b3 = st.columns([2,2,6])
-            with b1:
-                bank_date = st.date_input("Date", date.today())
-            with b2:
-                bank_text = st.text_input("Bank Amount (₹)", placeholder="e.g. 50000.00")
-            with b3:
-                bank_notes = st.text_input("Notes (optional)")
+            bank_date = b1.date_input("Date", date.today())
+            bank_text = b2.text_input("Bank Amount (₹)", placeholder="e.g. 50000.00")
+            bank_notes = b3.text_input("Notes (optional)")
             if st.form_submit_button("Set Bank Amount"):
                 try:
                     bank_amt = float(bank_text)
@@ -196,39 +233,15 @@ if page == "Dashboard / Add":
                 except ValueError:
                     st.error("❌ Enter a valid number for Bank Amount.")
 
-    # Expenses list as before
-    st.markdown("---")
-    st.subheader("🔍 Your Expenses")
-    col1, col2 = st.columns(2)
-    with col1:
-        start = st.date_input("From", date.today().replace(day=1), key="view_start")
-    with col2:
-        end = st.date_input("To", date.today(), key="view_end")
-    df = pd.read_sql_query(
-        "SELECT * FROM expenses WHERE date BETWEEN ? AND ? ORDER BY date DESC",
-        conn, params=(start.isoformat(), end.isoformat())
-    )
-    if df.empty:
-        st.info("No expenses in this range.")
-    else:
-        st.dataframe(df[["id","date","category","amount","notes"]], use_container_width=True)
-        st.download_button("📂 Download CSV", df.to_csv(index=False).encode(), "expenses.csv", "text/csv")
-        st.markdown("**🗑️ Delete Expenses**")
-        to_delete = st.multiselect(
-            "Select ID(s) to delete",
-            options=df["id"].tolist(),
-            format_func=lambda x: f"{x} → {df.loc[df.id==x,'category'].values[0]}, ₹{df.loc[df.id==x,'amount'].values[0]:.2f}"
-        )
-        if st.button("Delete selected"):
-            for did in to_delete:
-                c.execute("DELETE FROM expenses WHERE id = ?", (did,))
-                c.execute(
-                    "INSERT INTO records (timestamp, action, details) VALUES (?,?,?)",
-                    (datetime.now().isoformat(), "Delete Expense", f"ID {did}")
-                )
-            conn.commit()
-            st.success(f"Deleted IDs: {to_delete}")
-            st.rerun()
+elif page == "Edit Details":
+    st.header("✏️ Edit Metrics Manually")
+    today_exp, total_cred, current_bal, avg7, avg30 = get_sums()
+    with st.form("edit_form"):
+        st.session_state.override_today = st.number_input("Today's Spent", value=today_exp)
+        st.session_state.override_credit = st.number_input("Total Credited", value=total_cred)
+        st.session_state.override_balance = st.number_input("Bank Balance", value=current_bal)
+        if st.form_submit_button("Update Metrics"):
+            st.success("Metrics updated.")
 
 elif page == "Reports":
     st.header("📈 Expense Reports")
@@ -259,32 +272,17 @@ elif page == "Reports":
 
 else:  # Records page
     st.header("📝 Action Records")
-    # Show metrics
-    total_spent = c.execute("SELECT COALESCE(SUM(amount),0) FROM expenses").fetchone()[0]
-    total_cred = c.execute("SELECT COALESCE(SUM(amount),0) FROM balances").fetchone()[0]
-    _, _, current_bal = get_sums()
-    r1, r2, r3 = st.columns(3)
-    r1.metric("Total Spent", f"₹{total_spent:,.2f}")
-    r2.metric("Total Credited", f"₹{total_cred:,.2f}")
-    r3.metric("Bank Balance", f"₹{current_bal:,.2f}")
-    st.markdown("---")
-    # Date-range filter
-    c1, c2 = st.columns(2)
-    with c1:
-        rec_start = st.date_input("From", date.today().replace(day=1), key="rec_start")
-    with c2:
-        rec_end = st.date_input("To", date.today(), key="rec_end")
+    rec_start = st.date_input("From", date.today().replace(day=1), key="rec_start")
+    rec_end = st.date_input("To", date.today(), key="rec_end")
     rec_df = pd.read_sql_query(
         "SELECT timestamp, action, details FROM records WHERE date(timestamp) BETWEEN ? AND ? ORDER BY timestamp DESC",
         conn,
         params=(rec_start.isoformat(), rec_end.isoformat())
     )
-    # Format timestamp and columns
     if not rec_df.empty:
         rec_df['Date'] = pd.to_datetime(rec_df['timestamp']).dt.date
         rec_df = rec_df[['Date','action','details']]
         rec_df.columns = ['Date','Action','Details']
-        # Download and display
         csv = rec_df.to_csv(index=False).encode()
         st.download_button("📂 Download Records as CSV", csv, "records.csv", "text/csv")
         st.dataframe(rec_df, use_container_width=True)
