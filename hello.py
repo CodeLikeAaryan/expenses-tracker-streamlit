@@ -1,290 +1,243 @@
 import streamlit as st
 import pandas as pd
 import sqlite3
-from datetime import date, datetime, timedelta
-import altair as alt
+import datetime
+from io import BytesIO
 
-# — Page Config —
+DB_FILE = "expenses.db"
+CATEGORY_LIST = [
+    "Travel", "Food", "Personal Care", "Shopping", "Entertainment",
+    "SIP", "Upskilling", "Family & Loan", "Miscellaneous"
+]
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            type TEXT,
+            amount INTEGER,
+            category TEXT,
+            description TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS balance (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            amount INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def add_entry(date, entry_type, amount, category, description):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO expenses (date, type, amount, category, description) VALUES (?, ?, ?, ?, ?)",
+        (date, entry_type, amount, category, description)
+    )
+    conn.commit()
+    conn.close()
+
+def get_data():
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT * FROM expenses", conn)
+    conn.close()
+    return df
+
+def get_balance():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT amount FROM balance WHERE id = 1")
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def set_balance(new_amount):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO balance (id, amount) VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET amount=excluded.amount
+    """, (new_amount,))
+    conn.commit()
+    conn.close()
+
+def reset_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM expenses")
+    c.execute("DELETE FROM balance")
+    conn.commit()
+    conn.close()
+
+def get_spending_stats(df):
+    today = datetime.date.today()
+    first_of_month = today.replace(day=1)
+    today_spent = 0
+    month_spent = 0
+    if not df.empty:
+        df['date'] = pd.to_datetime(df['date']).dt.date
+        today_spent = df[
+            (df['type'] == "Expense") & (df['date'] == today)
+        ]['amount'].astype(int).sum()
+        month_spent = df[
+            (df['type'] == "Expense") & (df['date'] >= first_of_month) & (df['date'] <= today)
+        ]['amount'].astype(int).sum()
+    return today_spent, month_spent
+
+def get_current_balance(df, initial_balance):
+    total_credited = df[df['type'] == "Credited"]["amount"].astype(int).sum() if not df.empty else 0
+    total_expense = df[df['type'] == "Expense"]["amount"].astype(int).sum() if not df.empty else 0
+    current_balance = initial_balance + total_credited - total_expense
+    return current_balance
+
+def to_excel_bytes(df):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Records')
+    return output.getvalue()
+
+# --- Main App ---
 st.set_page_config(
-    page_title="📊 Mobile Expense Tracker",
+    page_title="Personal Expense Tracker",
+    page_icon="💸",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# — Database Setup —
-conn = sqlite3.connect("expenses.db", check_same_thread=False)
-c = conn.cursor()
-# Create tables if they don't exist
-c.execute("""CREATE TABLE IF NOT EXISTS expenses (
-    id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT,
-    category TEXT,
-    amount REAL,
-    notes TEXT
-)""")
-c.execute("""CREATE TABLE IF NOT EXISTS balances (
-    id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT,
-    amount REAL,
-    notes TEXT
-)""")
-c.execute("""CREATE TABLE IF NOT EXISTS account_balance (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    date    TEXT,
-    balance REAL,
-    notes   TEXT
-)""")
-c.execute("""CREATE TABLE IF NOT EXISTS records (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp TEXT,
-    action    TEXT,
-    details   TEXT
-)""")
-conn.commit()
+init_db()
 
-# — Cached Metrics —
-@st.cache_data
-def get_sums():
-    today_iso = date.today().isoformat()
-    # Today's total expense
-    today_exp = c.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM expenses WHERE date = ?", (today_iso,)
-    ).fetchone()[0]
-    # Total credits ever
-    total_cred = c.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM balances"
-    ).fetchone()[0]
-    # Latest manual bank set
-    row = c.execute(
-        "SELECT date, balance FROM account_balance ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    if row:
-        manual_date_iso, manual_bal = row
-    else:
-        manual_date_iso, manual_bal = today_iso, 0.0
-    # Dynamic balance
-    cred_after = c.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM balances WHERE date >= ?", (manual_date_iso,)
-    ).fetchone()[0]
-    exp_after = c.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM expenses WHERE date >= ?", (manual_date_iso,)
-    ).fetchone()[0]
-    current_bal = manual_bal + cred_after - exp_after
-    # Averages
-    d7 = (date.today() - timedelta(days=6)).isoformat()
-    sum7 = c.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM expenses WHERE date BETWEEN ? AND ?", (d7, today_iso)
-    ).fetchone()[0]
-    avg7 = sum7 / 7
-    d30 = (date.today() - timedelta(days=29)).isoformat()
-    sum30 = c.execute(
-        "SELECT COALESCE(SUM(amount),0) FROM expenses WHERE date BETWEEN ? AND ?", (d30, today_iso)
-    ).fetchone()[0]
-    avg30 = sum30 / 30
-    return today_exp, total_cred, current_bal, avg7, avg30
+# --- Sidebar Navigation ---
+section = st.sidebar.radio(
+    "Navigation",
+    ["Add Entry", "Add/Update Balance", "Stats & Analysis", "Records"]
+)
 
-# — Session override defaults —
-for key in ("override_today", "override_credit", "override_balance"):
-    if key not in st.session_state:
-        st.session_state[key] = None
+df = get_data()
+initial_balance = get_balance()
+current_balance = get_current_balance(df, initial_balance)
 
-# — Sidebar Navigation —
-st.sidebar.title("⚙️ Menu")
-page = st.sidebar.radio("", ["Dashboard / Add", "Edit Details", "Reports", "Records"])
+# --- Display Quick Spend Summary only on Add Entry and Stats & Analysis ---
+if section in ["Add Entry", "Stats & Analysis"]:
+    today_spent, month_spent = get_spending_stats(df)
+    st.markdown("### Overall Spend Summary")
+    col_t1, col_t2, col_t3 = st.columns(3)
+    col_t1.metric("Today's Total Spent", f"₹{today_spent}")
+    col_t2.metric("Monthly Spent", f"₹{month_spent}")
+    col_t3.metric("Current Balance", f"₹{current_balance}")
 
-# — Helper to apply overrides —
-def get_metrics():
-    today_exp, total_cred, current_bal, avg7, avg30 = get_sums()
-    if st.session_state.override_today is not None:
-        today_exp = st.session_state.override_today
-    if st.session_state.override_credit is not None:
-        total_cred = st.session_state.override_credit
-    if st.session_state.override_balance is not None:
-        current_bal = st.session_state.override_balance
-    return today_exp, total_cred, current_bal, avg7, avg30
+if section == "Add Entry":
+    st.header("Add New Entry")
+    with st.form(key="entry_form", clear_on_submit=True):
+        entry_date = st.date_input("Date", datetime.date.today())
+        entry_type = st.selectbox("Type", ["Expense", "Credited"])
+        amount = st.text_input("Amount (whole numbers only)", "")
 
-# — Main Pages —
-if page == "Dashboard / Add":
-    today_exp, total_cred, current_bal, avg7, avg30 = get_metrics()
-    cols = st.columns(5)
-    cols[0].metric("💸 Today's Spent", f"₹{today_exp:,.2f}")
-    cols[1].metric("💰 Total Credited", f"₹{total_cred:,.2f}")
-    cols[2].metric("🏦 Bank Balance", f"₹{current_bal:,.2f}")
-    cols[3].metric("🗓️ Weekly Average", f"₹{avg7:,.2f}")
-    cols[4].metric("🌐 Monthly Average", f"₹{avg30:,.2f}")
+        if entry_type == "Expense":
+            category = st.selectbox("Category", CATEGORY_LIST)
+            description = st.text_input("Description (optional)")
+        else:
+            category = ""
+            description = ""
 
-    st.markdown("---")
-    action = st.radio(
-        "Action:", ["Add Expense", "Add Credited Amount", "Set Bank Amount"], horizontal=True
-    )
+        submitted = st.form_submit_button("Add")
+        if submitted:
+            if not amount.isdigit() or int(amount) <= 0:
+                st.error("Amount must be a positive whole number.")
+            elif entry_type == "Expense" and not category:
+                st.error("Category is required for Expense.")
+            else:
+                add_entry(
+                    entry_date,
+                    entry_type,
+                    int(amount),
+                    category,
+                    description
+                )
+                st.success(f"{entry_type} of ₹{amount} added on {entry_date}.")
 
-    if action == "Add Expense":
-        st.subheader("➕ Add a New Expense")
-        with st.form("expense_form", clear_on_submit=True):
-            c1, c2, c3, c4 = st.columns([2,2,2,4])
-            exp_date = c1.date_input("Date", date.today())
-            category = c2.selectbox("Category", [
-                "Food","Learning","Investment","Entertainment",
-                "Shopping","Loans And Family","Miscellaneous"
-            ])
-            amt_text = c3.text_input("Amount (₹)", placeholder="e.g. 150.75")
-            notes = c4.text_input("Notes (optional)")
-            if st.form_submit_button("Add Expense"):
-                try:
-                    amt = float(amt_text)
-                    c.execute(
-                        "INSERT INTO expenses (date, category, amount, notes) VALUES (?,?,?,?)",
-                        (exp_date.isoformat(), category, amt, notes)
-                    )
-                    c.execute(
-                        "INSERT INTO records (timestamp, action, details) VALUES (?,?,?)",
-                        (
-                            datetime.now().isoformat(),
-                            "Expense",
-                            f"₹{amt:.2f} ({category})"
-                        )
-                    )
-                    conn.commit()
-                    st.success("✅ Expense recorded!")
-                    st.cache_data.clear()
-                    st.rerun()
-                except ValueError:
-                    st.error("❌ Enter a valid number for Amount.")
-        # Delete today's expenses
-        st.markdown("**🗑️ Delete Today's Expenses**")
-        today_str = date.today().isoformat()
-        df_today = pd.read_sql_query(
-            "SELECT id, category, amount FROM expenses WHERE date = ?", conn,
-            params=(today_str,)
-        )
-        if not df_today.empty:
-            to_delete = st.multiselect(
-                "Select IDs to delete:",
-                options=df_today.id.tolist(),
-                format_func=lambda x: f"{x} → {df_today[df_today.id==x].category.values[0]}, ₹{df_today[df_today.id==x].amount.values[0]:.2f}"
-            )
-            if st.button("Delete Selected"):
-                for did in to_delete:
-                    c.execute("DELETE FROM expenses WHERE id = ?", (did,))
-                    c.execute(
-                        "INSERT INTO records (timestamp, action, details) VALUES (?,?,?)",
-                        (datetime.now().isoformat(), "Delete Expense", f"ID {did}")
-                    )
-                conn.commit()
-                st.success(f"Deleted IDs: {to_delete}")
-                st.cache_data.clear()
-                st.rerun()
+elif section == "Add/Update Balance":
+    st.header("Add or Update Bank Balance")
+    st.info(f"Current Bank Balance: ₹{initial_balance}")
+    with st.form(key="balance_form", clear_on_submit=True):
+        new_balance = st.text_input("Set/Update your current bank balance (whole number)", value=str(initial_balance if initial_balance else ""))
+        balance_submitted = st.form_submit_button("Update Balance")
+        if balance_submitted:
+            if not new_balance.isdigit() or int(new_balance) < 0:
+                st.error("Balance must be a positive whole number (or zero).")
+            else:
+                set_balance(int(new_balance))
+                st.success(f"Bank balance updated to ₹{new_balance}")
 
-    elif action == "Add Balance":
-        st.subheader("➕ Add a Balance (Credit)")
-        with st.form("balance_form", clear_on_submit=True):
-            b1, b2, b3 = st.columns([2,2,6])
-            bal_date = b1.date_input("Date", date.today())
-            bal_text = b2.text_input("Credit Amount (₹)", placeholder="e.g. 2000.00")
-            bal_notes = b3.text_input("Notes (optional)")
-            if st.form_submit_button("Add Balance"):
-                try:
-                    bal_amt = float(bal_text)
-                    c.execute(
-                        "INSERT INTO balances (date, amount, notes) VALUES (?,?,?)",
-                        (bal_date.isoformat(), bal_amt, bal_notes)
-                    )
-                    c.execute(
-                        "INSERT INTO records (timestamp, action, details) VALUES (?,?,?)",
-                        (
-                            datetime.now().isoformat(),
-                            "Credit",
-                            f"₹{bal_amt:.2f}"
-                        )
-                    )
-                    conn.commit()
-                    st.success("✅ Balance added!")
-                    st.cache_data.clear()
-                    st.rerun()
-                except ValueError:
-                    st.error("❌ Enter a valid number for Credit Amount.")
-
-    else:  # Set Bank Amount
-        st.subheader("🏦 Set Bank Account Amount")
-        with st.form("bank_form", clear_on_submit=True):
-            b1, b2, b3 = st.columns([2,2,6])
-            bank_date = b1.date_input("Date", date.today())
-            bank_text = b2.text_input("Bank Amount (₹)", placeholder="e.g. 50000.00")
-            bank_notes = b3.text_input("Notes (optional)")
-            if st.form_submit_button("Set Bank Amount"):
-                try:
-                    bank_amt = float(bank_text)
-                    c.execute(
-                        "INSERT INTO account_balance (date, balance, notes) VALUES (?,?,?)",
-                        (bank_date.isoformat(), bank_amt, bank_notes)
-                    )
-                    c.execute(
-                        "INSERT INTO records (timestamp, action, details) VALUES (?,?,?)",
-                        (
-                            datetime.now().isoformat(),
-                            "Set Bank",
-                            f"Bank set to ₹{bank_amt:.2f}"
-                        )
-                    )
-                    conn.commit()
-                    st.success("✅ Bank amount updated!")
-                    st.cache_data.clear()
-                    st.rerun()
-                except ValueError:
-                    st.error("❌ Enter a valid number for Bank Amount.")
-
-elif page == "Edit Details":
-    st.header("✏️ Edit Metrics Manually")
-    today_exp, total_cred, current_bal, avg7, avg30 = get_sums()
-    with st.form("edit_form"):
-        st.session_state.override_today = st.number_input("Today's Spent", value=today_exp)
-        st.session_state.override_credit = st.number_input("Total Credited", value=total_cred)
-        st.session_state.override_balance = st.number_input("Bank Balance", value=current_bal)
-        if st.form_submit_button("Update Metrics"):
-            st.success("Metrics updated.")
-
-elif page == "Reports":
-    st.header("📈 Expense Reports")
-    df = pd.read_sql_query("SELECT * FROM expenses", conn)
+elif section == "Stats & Analysis":
+    st.header("Stats & Analysis")
     if df.empty:
-        st.warning("No data yet—add some expenses first.")
-        st.stop()
-    df["date"] = pd.to_datetime(df["date"])
-    df["month"] = df["date"].dt.to_period("M").astype(str)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Spent", f"₹{df['amount'].sum():,.2f}")
-    c2.metric("Avg. Daily Spend", f"₹{df.groupby('date')['amount'].sum().mean():,.2f}")
-    c3.metric("Top Category", df.groupby("category")["amount"].sum().idxmax())
-    st.markdown("---")
-    st.subheader("Spending Over Time")
-    ts = df.groupby("date")["amount"].sum().reset_index()
-    st.altair_chart(alt.Chart(ts).mark_line(point=True).encode(x="date:T", y="amount:Q").interactive(), use_container_width=True)
-    st.markdown("---")
-    st.subheader("Category Breakdown")
-    cat = df.groupby("category")["amount"].sum().reset_index()
-    l, r = st.columns(2)
-    l.altair_chart(alt.Chart(cat).mark_bar().encode(x=alt.X("category:N", sort="-y"), y="amount:Q", tooltip=["category","amount"]), use_container_width=True)
-    r.altair_chart(alt.Chart(cat).mark_arc(innerRadius=50).encode(theta="amount:Q", color="category:N", tooltip=["category","amount"]), use_container_width=True)
-    st.markdown("---")
-    st.subheader("Monthly Totals")
-    monthly = df.groupby("month")["amount"].sum().reset_index()
-    st.altair_chart(alt.Chart(monthly).mark_line(point=True).encode(x="month:T", y="amount:Q").interactive(), use_container_width=True)
-
-else:  # Records page
-    st.header("📝 Action Records")
-    rec_start = st.date_input("From", date.today().replace(day=1), key="rec_start")
-    rec_end = st.date_input("To", date.today(), key="rec_end")
-    rec_df = pd.read_sql_query(
-        "SELECT timestamp, action, details FROM records WHERE date(timestamp) BETWEEN ? AND ? ORDER BY timestamp DESC",
-        conn,
-        params=(rec_start.isoformat(), rec_end.isoformat())
-    )
-    if not rec_df.empty:
-        rec_df['Date'] = pd.to_datetime(rec_df['timestamp']).dt.date
-        rec_df = rec_df[['Date','action','details']]
-        rec_df.columns = ['Date','Action','Details']
-        csv = rec_df.to_csv(index=False).encode()
-        st.download_button("📂 Download Records as CSV", csv, "records.csv", "text/csv")
-        st.dataframe(rec_df, use_container_width=True)
+        st.info("No data yet. Start adding your expenses or credits.")
     else:
-        st.info("No records in this range.")
+        df['date'] = pd.to_datetime(df['date']).dt.date
+        df['amount'] = df['amount'].astype(int)
+
+        st.subheader("Daily Summary")
+        daily = (
+            df[df['type'].isin(["Expense", "Credited"])]
+            .groupby(['date', 'type'])['amount']
+            .sum()
+            .unstack(fill_value=0)
+            .reset_index()
+        )
+        st.dataframe(daily, use_container_width=True)
+
+        st.subheader("Category-wise Expense")
+        cat_exp = (
+            df[df['type'] == "Expense"]
+            .groupby("category")['amount'].sum().sort_values(ascending=False)
+        )
+        st.bar_chart(cat_exp)
+
+        st.subheader("Expense/Credit Trend")
+        chart_df = (
+            df[df['type'].isin(["Expense", "Credited"])]
+            .groupby(['date', 'type'])['amount']
+            .sum()
+            .unstack(fill_value=0)
+        )
+        st.line_chart(chart_df)
+
+        st.subheader("All Entries")
+        st.dataframe(df.sort_values("date", ascending=False), use_container_width=True)
+
+        st.markdown("---")
+        st.download_button("Download as CSV", df.to_csv(index=False), "expenses.csv")
+        if st.button("Reset All Data"):
+            reset_db()
+            st.warning("All data reset. Please reload the page.")
+
+elif section == "Records":
+    st.header("Records: View Activity By Date Range")
+    if df.empty:
+        st.info("No data yet.")
+    else:
+        df['date'] = pd.to_datetime(df['date']).dt.date
+        min_date = df['date'].min()
+        max_date = df['date'].max()
+        col1, col2 = st.columns(2)
+        from_date = col1.date_input("From", min_value=min_date, max_value=max_date, value=min_date)
+        to_date = col2.date_input("To", min_value=min_date, max_value=max_date, value=max_date)
+        if from_date > to_date:
+            st.warning("Start date must be before end date.")
+        else:
+            filtered = df[(df['date'] >= from_date) & (df['date'] <= to_date)]
+            st.subheader(f"All records from {from_date} to {to_date}")
+            st.dataframe(filtered.sort_values("date", ascending=False), use_container_width=True)
+            if not filtered.empty:
+                excel_data = to_excel_bytes(filtered)
+                st.download_button(
+                    label="Download as Excel",
+                    data=excel_data,
+                    file_name=f"records_{from_date}_to_{to_date}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
